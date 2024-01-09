@@ -1,26 +1,60 @@
 #!/bin/bash
-
-KEYLIME_HOME=/root/keylime
+set -x
 
 # Configure swtpm2
-cd ${KEYLIME_HOME}/swtpm2_scripts
-chmod +x init_tpm_server
-chmod +x tpm_serverd
-install -c tpm_serverd /usr/local/bin/tpm_serverd
-install -c init_tpm_server /usr/local/bin/init_tpm_server
-# Server needs to be running, or tpm2-abrmd.service will fail.
-/usr/local/bin/tpm_serverd
+mkdir /tmp/tpmdir
+swtpm_setup --tpm2 \
+     --tpmstate /tmp/tpmdir \
+     --createek --decryption --create-ek-cert \
+     --create-platform-cert \
+     --display
+swtpm socket --tpm2 \
+     --tpmstate dir=/tmp/tpmdir \
+     --flags startup-clear \
+     --ctrl type=tcp,port=2322 \
+     --server type=tcp,port=2321 \
+     --daemon
+export TPM2TOOLS_TCTI=tabrmd:
+export TCTI=tabrmd:
 
-export TPM2TOOLS_TCTI="tabrmd:bus_name=com.intel.tss2.Tabrmd"
-pkill -HUP dbus-daemon
+# Configure dbus
+sudo rm -rf /var/run/dbus
+sudo mkdir /var/run/dbus
+sudo dbus-daemon --system
 
-# Configure tpm2-abrmd systemd
-sed -i 's/.*ExecStart.*/ExecStart=\/usr\/sbin\/tpm2-abrmd --tcti=mssim/' /usr/lib/systemd/system/tpm2-abrmd.service
-systemctl daemon-reload
-systemctl enable tpm2-abrmd
-systemctl start tpm2-abrmd
+tpm2-abrmd \
+    --logger=stdout \
+    --tcti=swtpm: \
+    --flush-all \
+    --allow-root &
+
+# Create test user
+useradd -s /sbin/nologin -g tss keylime
 
 # Run tests
-cd ${KEYLIME_HOME}/test
-chmod +x ./run_tests.sh
-./run_tests.sh -s openssl
+if [ "$GITHUB_ACTIONS" == "true" ]
+then
+    REPO_DIR=$GITHUB_WORKSPACE
+else
+    REPO_DIR="/root/keylime"
+fi
+
+# Move /etc/keylime.conf because there might a old one distributed with the container.
+if [ -f "/etc/keylime.conf" ]
+then
+    echo "Moving /etc/keylime.conf from the container to /etc/keylime.conf.orig"
+    mv /etc/keylime.conf /etc/keylime.conf.orig
+fi
+
+# Move configuration files that might be distributed with the container.
+for c in agent verifier registrar tenant ca logging
+do
+    if [ -f "/etc/keylime/$c.conf" ]
+    then
+        echo "Moving /etc/keylime/$c.conf from the container to /etc/keylime/$c.conf.orig"
+        mv /etc/keylime/$c.conf /etc/keylime/$c.conf.orig
+    fi
+done
+
+chmod +x $REPO_DIR/test/run_tests.sh
+$REPO_DIR/test/run_tests.sh

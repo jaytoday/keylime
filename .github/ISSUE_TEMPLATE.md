@@ -1,3 +1,5 @@
+Is your issue a feature request? If so, please raise it as an [enhancement](https://github.com/keylime/enhancements)
+
 # Environment
  * OS / version: 
  * Processor architecture: 

@@ -1,125 +1,206 @@
-'''
-DISTRIBUTION STATEMENT A. Approved for public release: distribution unlimited.
+import datetime
+from typing import List, Optional, Tuple
 
-This material is based upon work supported by the Assistant Secretary of Defense for 
-Research and Engineering under Air Force Contract No. FA8721-05-C-0002 and/or 
-FA8702-15-D-0001. Any opinions, findings, conclusions or recommendations expressed in this
-material are those of the author(s) and do not necessarily reflect the views of the 
-Assistant Secretary of Defense for Research and Engineering.
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric.dsa import DSAPrivateKey
+from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed448 import Ed448PrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPublicKey
+from cryptography.hazmat.primitives.serialization import Encoding, load_pem_private_key
+from cryptography.x509 import Certificate, CertificateBuilder, Name
+from cryptography.x509.oid import NameOID
 
-Copyright 2016 Massachusetts Institute of Technology.
+from keylime import config
+from keylime.types import CERTIFICATE_PRIVATE_KEY_TYPES
 
-The software/firmware is provided to you on an As-Is basis
 
-Delivered to the US Government with Unlimited Rights, as defined in DFARS Part 
-252.227-7013 or 7014 (Feb 2014). Notwithstanding any copyright notice, U.S. Government 
-rights in this work are defined by DFARS 252.227-7013 or DFARS 252.227-7014 as detailed 
-above. Use of this work other than as specifically authorized by the U.S. Government may 
-violate any copyrights that exist in this work.
-'''
-
-import time
-from M2Crypto import X509, EVP, RSA, ASN1
-import ConfigParser
-
-import common
-config = ConfigParser.SafeConfigParser()
-config.read(common.CONFIG_FILE)
-
-def mk_cert_valid(cert, days=365):
+def mk_cert_valid(cert_req: CertificateBuilder, days: int = 365) -> CertificateBuilder:
     """
     Make a cert valid from now and til 'days' from now.
     Args:
-       cert -- cert to make valid
+       cert_req -- cryptography.x509.base.CertificateBuilder
        days -- number of days cert is valid for from now.
+    Returns: updated cryptography.x509.base.CertificateBuilder
     """
-    t = long(time.time())
-    now = ASN1.ASN1_UTCTIME()
-    now.set_time(t)
-    expire = ASN1.ASN1_UTCTIME()
-    expire.set_time(t + days * 24 * 60 * 60)
-    cert.set_not_before(now)
-    cert.set_not_after(expire)
+
+    one_day = datetime.timedelta(1, 0, 0)
+    today = datetime.datetime.now(datetime.timezone.utc)
+    cert_req = cert_req.not_valid_before(today)
+    cert_req = cert_req.not_valid_after(today + (one_day * days))
+    return cert_req
 
 
-def mk_request(bits, cn):
+def mk_name(common_name: str) -> Name:
+    return x509.Name(
+        [
+            x509.NameAttribute(NameOID.COUNTRY_NAME, config.get("ca", "cert_country")),
+            x509.NameAttribute(NameOID.COMMON_NAME, common_name),
+            x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, config.get("ca", "cert_state")),
+            x509.NameAttribute(NameOID.LOCALITY_NAME, config.get("ca", "cert_locality")),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, config.get("ca", "cert_organization")),
+            x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, config.get("ca", "cert_org_unit")),
+        ]
+    )
+
+
+def mk_request(bits: int, common_name: str) -> Tuple[CertificateBuilder, RSAPrivateKey]:
     """
     Create a X509 request with the given number of bits in they key.
     Args:
       bits -- number of RSA key bits
-      cn -- common name in the request
-    Returns a X509 request and the private key (EVP)
+      common_name -- common name in the request
+    Returns a X509 request and the private key
     """
-    pk = EVP.PKey()
-    x = X509.Request()
-    rsa = RSA.gen_key(bits, 65537, lambda: None)
-    pk.assign_rsa(rsa)
-    x.set_pubkey(pk)
-    name = x.get_subject()
-    name.C = config.get('ca','cert_country')
-    name.CN = cn
-    name.ST = config.get('ca','cert_state')
-    name.L = config.get('ca','cert_locality')
-    name.O = config.get('ca','cert_organization')
-    name.OU = config.get('ca','cert_org_unit')
-    x.sign(pk,'sha256')
-    return x, pk
+
+    privkey = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=bits,
+        backend=default_backend(),
+    )
+
+    cert_req = x509.CertificateBuilder()
+
+    subject = mk_name(common_name)
+    cert_req = cert_req.subject_name(subject)
+    return cert_req, privkey
 
 
-def mk_cacert(name=None):
+def mk_cacert(name: Optional[str] = None) -> Tuple[Certificate, RSAPrivateKey, RSAPublicKey]:
     """
     Make a CA certificate.
     Returns the certificate, private key and public key.
     """
-    req, pk = mk_request(config.getint('ca','cert_bits'),config.get('ca','cert_ca_name'))
-    pkey = req.get_pubkey()
-    cert = X509.X509()
-    cert.set_serial_number(1)
-    cert.set_version(2)
-    mk_cert_valid(cert,config.getint('ca','cert_ca_lifetime'))
-    
-    if name==None:
-        name = config.get('ca','cert_ca_name')
 
-    issuer = X509.X509_Name()
-    issuer.C = config.get('ca','cert_country')
-    issuer.CN = name
-    issuer.ST = config.get('ca','cert_state')
-    issuer.L = config.get('ca','cert_locality')
-    issuer.O = config.get('ca','cert_organization')
-    issuer.OU = config.get('ca','cert_org_unit')
-    cert.set_issuer(issuer)
-    cert.set_subject(cert.get_issuer())
-    cert.set_pubkey(pkey)
-    cert.add_ext(X509.new_extension('basicConstraints', 'CA:TRUE'))
-    cert.add_ext(X509.new_extension('subjectKeyIdentifier', str(cert.get_fingerprint())))
-    cert.add_ext(X509.new_extension('crlDistributionPoints','URI:http://localhost/crl.pem'))
-    cert.add_ext(X509.new_extension('keyUsage', 'keyCertSign, cRLSign'))
-    cert.sign(pk, 'sha256')
-    return cert, pk, pkey
+    if name is None:
+        name = config.get("ca", "cert_ca_name")
+    cert_req, privkey = mk_request(config.getint("ca", "cert_bits"), name)
 
-def mk_signed_cert(cacert,ca_pk,name,serialnum):
+    pubkey = privkey.public_key()
+    cert_req = cert_req.public_key(pubkey)
+
+    cert_req = cert_req.serial_number(1)
+    cert_req = mk_cert_valid(cert_req, config.getint("ca", "cert_ca_lifetime"))
+    cert_req = cert_req.issuer_name(mk_name(name))
+
+    # Extensions.
+    extensions = [
+        # Basic Constraints.
+        x509.BasicConstraints(ca=True, path_length=None),
+        # Subject Key Identifier.
+        x509.SubjectKeyIdentifier.from_public_key(pubkey),
+        # CRL Distribution Points.
+        x509.CRLDistributionPoints(
+            [
+                x509.DistributionPoint(
+                    full_name=[
+                        x509.UniformResourceIdentifier(config.get("ca", "cert_crl_dist")),
+                    ],
+                    relative_name=None,
+                    reasons=None,
+                    crl_issuer=None,
+                ),
+            ]
+        ),
+        # Key Usage.
+        x509.KeyUsage(
+            key_cert_sign=True,
+            crl_sign=True,
+            digital_signature=False,
+            content_commitment=False,
+            key_encipherment=False,
+            data_encipherment=False,
+            key_agreement=False,
+            encipher_only=False,
+            decipher_only=False,
+        ),
+    ]
+
+    for ext in extensions:
+        cert_req = cert_req.add_extension(ext, critical=False)
+
+    cert = cert_req.sign(
+        private_key=privkey,
+        algorithm=hashes.SHA256(),
+        backend=default_backend(),
+    )
+
+    return cert, privkey, pubkey
+
+
+def mk_signed_cert(
+    cacert: Certificate, ca_privkey: CERTIFICATE_PRIVATE_KEY_TYPES, name: str, serialnum: int
+) -> Tuple[Certificate, RSAPrivateKey]:
     """
     Create a CA cert + server cert + server private key.
     """
-    # unused, left for history.
-    cert_req, pk = mk_request(config.getint('ca','cert_bits'), cn=name)
-    
-    cert = X509.X509()
-    cert.set_serial_number(serialnum)
-    cert.set_version(2)
-    mk_cert_valid(cert)
-    cert.add_ext(X509.new_extension('nsComment', 'SSL sever'))
-    cert.add_ext(X509.new_extension('subjectAltName','DNS:%s'%name))
-    cert.add_ext(X509.new_extension('crlDistributionPoints','URI:http://localhost/crl.pem'))
-    
-    cert.set_subject(cert_req.get_subject())
-    cert.set_pubkey(cert_req.get_pubkey())
-    cert.set_issuer(cacert.get_issuer())
-    cert.sign(ca_pk, 'sha256')
-    return cert, pk
 
-def gencrl(_,a,b):
-    logger = common.init_logging('ca_impl_openssl')
-    logger.warning("CRL creation with openssl is not supported")
-    return "" 
+    cert_req, privkey = mk_request(config.getint("ca", "cert_bits"), common_name=name)
+    pubkey = privkey.public_key()
+    cert_req = cert_req.public_key(pubkey)
+
+    cert_req = cert_req.serial_number(serialnum)
+    cert_req = mk_cert_valid(cert_req)
+    cert_req = cert_req.issuer_name(cacert.issuer)
+
+    # Extensions.
+    extensions = [
+        # OID 2.16.840.1.113730.1.13 is Netscape Comment.
+        # http://oid-info.com/get/2.16.840.1.113730.1.13
+        x509.UnrecognizedExtension(
+            oid=x509.ObjectIdentifier("2.16.840.1.113730.1.13"),
+            value=b"SSL Server",
+        ),
+        # Subject Alternative Name.
+        x509.SubjectAlternativeName([x509.DNSName(name)]),
+        # CRL Distribution Points.
+        x509.CRLDistributionPoints(
+            [
+                x509.DistributionPoint(
+                    full_name=[
+                        x509.UniformResourceIdentifier(config.get("ca", "cert_crl_dist")),
+                    ],
+                    relative_name=None,
+                    reasons=None,
+                    crl_issuer=None,
+                ),
+            ]
+        ),
+    ]
+
+    for ext in extensions:
+        cert_req = cert_req.add_extension(ext, critical=False)
+
+    cert = cert_req.sign(
+        private_key=ca_privkey,
+        algorithm=hashes.SHA256(),
+        backend=default_backend(),
+    )
+    return cert, privkey
+
+
+def gencrl(serials: List[int], cert: str, ca_pk: str) -> bytes:
+    ca_cert = x509.load_pem_x509_certificate(cert.encode())
+    priv_key = load_pem_private_key(ca_pk.encode(), None, backend=default_backend())
+    date_now = datetime.datetime.now(datetime.timezone.utc)
+
+    builder = x509.CertificateRevocationListBuilder()
+    builder = builder.issuer_name(ca_cert.issuer)
+    builder = builder.last_update(date_now)
+    builder = builder.next_update(date_now)
+
+    for serial in serials:
+        cert_builder = x509.RevokedCertificateBuilder()
+        cert_builder = cert_builder.serial_number(int(serial))
+        cert_builder = cert_builder.revocation_date(date_now)
+        builder = builder.add_revoked_certificate(cert_builder.build())
+
+    if not isinstance(
+        priv_key, (EllipticCurvePrivateKey, RSAPrivateKey, DSAPrivateKey, Ed448PrivateKey, Ed25519PrivateKey)
+    ):
+        raise ValueError(f"Unsupported key type {type(priv_key).__name__}")
+    crl = builder.sign(private_key=priv_key, algorithm=hashes.SHA256(), backend=default_backend())
+    return crl.public_bytes(encoding=Encoding.DER)

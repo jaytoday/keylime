@@ -1,6 +1,17 @@
 /cloudinit_script_encrypted.txt
+
+# For Python virtual environments
+.venv
+
+# Created automatically by a popular IDE
+.vscode
+
+# Suggested by a popular IDE when it tells me I should save my workspace
+workspace.code-workspace
+
 # Backup files
 *.~
+*~
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -24,6 +35,9 @@ var/
 .installed.cfg
 *.egg
 MANIFEST
+AUTHORS
+ChangeLog
+/config/
 
 # Installer logs
 pip-log.txt
@@ -43,7 +57,12 @@ coverage.xml
 docs/_build/
 
 # Keylime specifics
-swtpm2_scripts/NVChip
+scripts/NVChip
 test/.auditing-*
 test/NVChip
+NVChip
 test/testdata.sqlite
+cv_data.sqlite
+reg_data.sqlite
+tpmdata.yml
+encrypted_payload

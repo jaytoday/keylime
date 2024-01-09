@@ -1,166 +1,193 @@
-#!/usr/bin/env python
-
-'''
-DISTRIBUTION STATEMENT A. Approved for public release: distribution unlimited.
-
-This material is based upon work supported by the Assistant Secretary of Defense for 
-Research and Engineering under Air Force Contract No. FA8721-05-C-0002 and/or 
-FA8702-15-D-0001. Any opinions, findings, conclusions or recommendations expressed in this
-material are those of the author(s) and do not necessarily reflect the views of the 
-Assistant Secretary of Defense for Research and Engineering.
-
-Copyright 2017 Massachusetts Institute of Technology.
-
-The software/firmware is provided to you on an As-Is basis
-
-Delivered to the US Government with Unlimited Rights, as defined in DFARS Part 
-252.227-7013 or 7014 (Feb 2014). Notwithstanding any copyright notice, U.S. Government 
-rights in this work are defined by DFARS 252.227-7013 or DFARS 252.227-7014 as detailed 
-above. Use of this work other than as specifically authorized by the U.S. Government may 
-violate any copyrights that exist in this work.
-'''
-
-import zmq
-import common
-import ConfigParser
-import json
-import crypto
-import threading
 import functools
-import time
 import os
-import sys
-from multiprocessing import Process
 import signal
+import sys
+import threading
+import time
+from multiprocessing import Process
+from typing import Any, Callable, Dict, Optional, Set
 
-logger = common.init_logging('revocation_notifier')
+import requests
 
-config = ConfigParser.SafeConfigParser()
-config.read(common.CONFIG_FILE)
+from keylime import config, crypto, json, keylime_logging
+from keylime.common import retry
 
-broker_proc = None
+logger = keylime_logging.init_logging("revocation_notifier")
+broker_proc: Optional[Process] = None
 
-def start_broker():
-    def worker():
-        context = zmq.Context(1)
+_SOCKET_PATH = "/var/run/keylime/keylime.verifier.ipc"
+
+
+# return the revocation notification methods for cloud verifier
+def get_notifiers() -> Set[str]:
+    notifiers = set(config.getlist("verifier", "enabled_revocation_notifications", section="revocations"))
+    return notifiers.intersection({"zeromq", "webhook", "agent"})
+
+
+def start_broker() -> None:
+    assert "zeromq" in get_notifiers()
+    try:
+        import zmq  # pylint: disable=import-outside-toplevel
+    except ImportError as error:
+        raise Exception("install PyZMQ for 'zeromq' in 'enabled_revocation_notifications' option") from error
+
+    def worker() -> None:
+        def sig_handler(*_: Any) -> None:
+            sys.exit(0)
+
+        # do not receive signals form the parent process
+        os.setpgrp()
+        signal.signal(signal.SIGTERM, sig_handler)
+        dir_name = os.path.dirname(_SOCKET_PATH)
+        if not os.path.exists(dir_name):
+            os.makedirs(dir_name, 0o700)
+        else:
+            if os.stat(dir_name).st_mode & 0o777 != 0o700:
+                msg = f"{dir_name} present with wrong permissions"
+                logger.error(msg)
+                raise Exception(msg)
+
+        context = zmq.Context(1)  # pylint: disable=abstract-class-instantiated
         frontend = context.socket(zmq.SUB)
-        frontend.bind("ipc:///tmp/keylime.verifier.ipc")
-        
-        frontend.setsockopt(zmq.SUBSCRIBE, "")
-        
+        frontend.bind(f"ipc://{_SOCKET_PATH}")
+
+        frontend.setsockopt(zmq.SUBSCRIBE, b"")
+
         # Socket facing services
         backend = context.socket(zmq.PUB)
-        backend.bind("tcp://*:%s"%config.getint('general','revocation_notifier_port'))
+        backend.bind(
+            f"tcp://{config.get('verifier', 'zmq_ip', section='revocations')}:"
+            f"{config.getint('verifier', 'zmq_port', section='revocations')}"
+        )
+        try:
+            zmq.device(zmq.FORWARDER, frontend, backend)
+        except (KeyboardInterrupt, SystemExit):
+            context.destroy()
 
-        zmq.device(zmq.FORWARDER, frontend, backend)
-    
     global broker_proc
-    broker_proc = Process(target=worker)
+    broker_proc = Process(target=worker, name="zeroMQ")
     broker_proc.start()
 
-    
-def stop_broker():
-    global broker_proc
-    if broker_proc is not None:
-        os.kill(broker_proc.pid,signal.SIGKILL)
 
-def notify(tosend):
-    def worker(tosend):
-        context = zmq.Context()
+def stop_broker() -> None:
+    if broker_proc is not None:
+        # Remove the socket file before  we kill the process
+        if os.path.exists(f"ipc://{_SOCKET_PATH}"):
+            os.remove(f"ipc://{_SOCKET_PATH}")
+        logger.info("Stopping revocation notifier...")
+        broker_proc.terminate()
+        broker_proc.join(5)
+        if broker_proc.is_alive() and sys.version_info >= (3, 7):
+            logger.debug("Killing revocation notifier because it did not terminate after 5 seconds...")
+            broker_proc.kill()  # pylint: disable=E1101
+
+
+def notify(tosend: Dict[str, Any]) -> None:
+    assert "zeromq" in get_notifiers()
+    try:
+        import zmq  # pylint: disable=import-outside-toplevel
+    except ImportError as error:
+        raise Exception("install PyZMQ for 'zeromq' in 'revocation_notifier' option") from error
+
+    # python-requests internally uses either simplejson (preferred) or
+    # the built-in json module, and when it is using the built-in one,
+    # it may encounter difficulties handling bytes instead of strings.
+    # To avoid such issues, let's convert `tosend' to str beforehand.
+    tosend = json.bytes_to_str(tosend)
+
+    def worker(tosend: Dict[str, Any]) -> None:
+        context = zmq.Context()  # pylint: disable=abstract-class-instantiated
         mysock = context.socket(zmq.PUB)
-        mysock.connect("ipc:///tmp/keylime.verifier.ipc")
+        mysock.connect(f"ipc://{_SOCKET_PATH}")
         # wait 100ms for connect to happen
-        time.sleep(0.1)
-        # now send it out vi 0mq
-        for i in range(config.getint('cloud_verifier','max_retries')):
+        time.sleep(0.2)
+        # now send it out via 0mq
+        logger.info("Sending revocation event to listening nodes...")
+        for i in range(config.getint("verifier", "max_retries")):
             try:
-                mysock.send(json.dumps(tosend))
+                mysock.send_string(json.dumps(tosend))
                 break
             except Exception as e:
-                logger.debug("Unable to publish revocation message %d times, trying again in %f seconds: %s"%(i,config.getfloat('cloud_verifier','retry_interval'),e))
-                time.sleep(config.getfloat('cloud_verifier','retry_interval'))
+                interval = config.getfloat("verifier", "retry_interval")
+                exponential_backoff = config.getboolean("verifier", "exponential_backoff")
+                next_retry = retry.retry_time(exponential_backoff, interval, i, logger)
+                logger.debug(
+                    "Unable to publish revocation message %d times, trying again in %f seconds: %s", i, next_retry, e
+                )
+                time.sleep(next_retry)
         mysock.close()
-        
-    cb = functools.partial(worker,tosend)
+
+    cb = functools.partial(worker, tosend)
     t = threading.Thread(target=cb)
     t.start()
 
-cert_key=None
 
-def await_notifications(callback,revocation_cert_path):
-    global cert_key
-    
-    if revocation_cert_path is None:
-        raise Exception("must specify revocation_cert_path")
-    
-    context = zmq.Context()
-    mysock = context.socket(zmq.SUB)
-    mysock.setsockopt(zmq.SUBSCRIBE, '')
-    mysock.connect("tcp://%s:%s"%(config.get('general','revocation_notifier_ip'),config.getint('general','revocation_notifier_port')))
-    
-    logger.info('Waiting for revocation messages on 0mq %s:%s'%
-                (config.get('general','revocation_notifier_ip'),config.getint('general','revocation_notifier_port')))
-    
-    while True:
-        rawbody = mysock.recv()
-        body = json.loads(rawbody)
-        if cert_key is None:
-            # load up the CV signing public key
-            if revocation_cert_path is not None and os.path.exists(revocation_cert_path):
-                logger.info("Lazy loading the revocation certificate from %s"%revocation_cert_path)
-                with open(revocation_cert_path,'r') as f:
-                    certpem = f.read()
-                cert_key = crypto.rsa_import_pubkey(certpem)
-        
-        if cert_key is None:
-            logger.warning("Unable to check signature of revocation message: %s not available"%revocation_cert_path)
-        elif str(body['signature'])=='none':
-            logger.warning("No signature on revocation message from server")
-        elif not crypto.rsa_verify(cert_key,str(body['msg']),str(body['signature'])):
-            logger.error("Invalid revocation message siganture %s"%body)
-        else:
-            message = json.loads(body['msg'])
-            logger.debug("Revocation signature validated for revocation: %s"%message)
-            callback(message)
+def notify_webhook(tosend: Dict[str, Any]) -> None:
+    url = config.get("verifier", "webhook_url", section="revocations", fallback="")
+    # Check if a url was specified
+    if url == "":
+        return
 
-def main():
-    start_broker()
-    
-    import secure_mount
-    
-    def worker():
-        def print_notification(revocation):
-            logger.warning("Received revocation: %s"%revocation)
-            
-        keypath = '%s/unzipped/RevocationNotifier-cert.crt'%(secure_mount.mount())
-        await_notifications(print_notification,revocation_cert_path=keypath)
-    
-    t = threading.Thread(target=worker)
+    # Similarly to notify(), let's convert `tosend' to str to prevent
+    # possible issues with json handling by python-requests.
+    tosend = json.bytes_to_str(tosend)
+
+    def worker_webhook(tosend: Dict[str, Any], url: str) -> None:
+        interval = config.getfloat("verifier", "retry_interval")
+        exponential_backoff = config.getboolean("verifier", "exponential_backoff")
+        with requests.Session() as session:
+            logger.info("Sending revocation event via webhook...")
+            for i in range(config.getint("verifier", "max_retries")):
+                next_retry = retry.retry_time(exponential_backoff, interval, i, logger)
+                try:
+                    response = session.post(url, json=tosend, timeout=5)
+                    if response.status_code in [200, 202]:
+                        break
+
+                    logger.debug(
+                        "Unable to publish revocation message %d times via webhook, "
+                        "trying again in %d seconds. "
+                        "Server returned status code: %s",
+                        i,
+                        next_retry,
+                        response.status_code,
+                    )
+                except requests.exceptions.RequestException as e:
+                    logger.debug(
+                        "Unable to publish revocation message %d times via webhook, trying again in %d seconds: %s",
+                        i,
+                        next_retry,
+                        e,
+                    )
+
+                time.sleep(next_retry)
+
+    w = functools.partial(worker_webhook, tosend, url)
+    t = threading.Thread(target=w, daemon=True)
     t.start()
-    #time.sleep(0.5)
 
-    json_body2 = {
-        'v': 'vbaby',
-        'agent_id': '2094aqrea3',
-        'cloudagent_ip': 'ipaddy',
-        'cloudagent_port': '39843',
-        'tpm_policy': '{"ab":"1"}',
-        'vtpm_policy': '{"ab":"1"}',
-        'metadata': '{"cert_serial":"1"}',
-        'ima_whitelist': '{}',
-        'revocation_key': '',
-        'revocation': '{"cert_serial":"1"}',
-        }
-    
-    print "sending notification"
-    notify(json_body2)
-    
-    time.sleep(2)
-    print "shutting down"
-    stop_broker()
-    print "exiting..."
-    sys.exit(0)
-    print "done"
-     
-if __name__=="__main__":
-    main()
+
+cert_key = None
+
+
+def process_revocation(revocation: Dict[str, Any], callback: Callable[[Dict[str, Any]], None], cert_path: str) -> None:
+    global cert_key
+
+    if cert_key is None:
+        # load up the CV signing public key
+        if cert_path is not None and os.path.exists(cert_path):
+            logger.info("Lazy loading the revocation certificate from %s", cert_path)
+            with open(cert_path, "rb") as f:
+                certpem = f.read()
+            cert_key = crypto.x509_import_pubkey(certpem)
+
+    if cert_key is None:
+        logger.warning("Unable to check signature of revocation message: %s not available", cert_path)
+    elif "signature" not in revocation or revocation["signature"] == "none":
+        logger.warning("No signature on revocation message from server")
+    elif not crypto.rsa_verify(cert_key, revocation["msg"].encode("utf-8"), revocation["signature"].encode("utf-8")):
+        logger.error("Invalid revocation message siganture %s", revocation)
+    else:
+        message = json.loads(revocation["msg"])
+        logger.debug("Revocation signature validated for revocation: %s", message)
+        callback(message)

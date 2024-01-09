@@ -1,29 +1,14 @@
 #!/bin/bash
-##########################################################################################
-#
-# DISTRIBUTION STATEMENT A. Approved for public release: distribution unlimited.
-#
-# This material is based upon work supported by the Assistant Secretary of Defense for
-# Research and Engineering under Air Force Contract No. FA8721-05-C-0002 and/or
-# FA8702-15-D-0001. Any opinions, findings, conclusions or recommendations expressed in
-# this material are those of the author(s) and do not necessarily reflect the views of the
-# Assistant Secretary of Defense for Research and Engineering.
-#
+################################################################################
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2017 Massachusetts Institute of Technology.
-#
-# The software/firmware is provided to you on an As-Is basis
-#
-# Delivered to the US Government with Unlimited Rights, as defined in DFARS Part
-# 252.227-7013 or 7014 (Feb 2014). Notwithstanding any copyright notice, U.S. Government
-# rights in this work are defined by DFARS 252.227-7013 or DFARS 252.227-7014 as detailed
-# above. Use of this work other than as specifically authorized by the U.S. Government may
-# violate any copyrights that exist in this work.
-#
-##########################################################################################
+################################################################################
 
+# Set python3 as default
+alias python='/usr/bin/python3'
 
-# Find Keylime directory (we're in test/ directory)
-KEYLIME_DIR=`pwd`/../
+# Find Keylime directory. It's one directory above the location of this script
+KEYLIME_SRC=$(realpath "$(dirname "$(readlink -f "$0")")/../")
 
 # Get list of tests in the test directory
 TEST_LIST=`ls | grep "^test_.*\.py$"`
@@ -36,15 +21,7 @@ COVERAGE=0
 COVERAGE_DIR=`pwd`
 unset COVERAGE_FILE
 
-for opt in "$@"; do
-  shift
-  case "$opt" in
-    "--ssl") set -- "$@" "-s" ;;
-    *)       set -- "$@" "$opt"
-  esac
-done
-
-while getopts ":cuhs:" opt; do
+while getopts ":cuh:" opt; do
     case $opt in
         c)
             COVERAGE=1
@@ -57,19 +34,11 @@ while getopts ":cuhs:" opt; do
             UMODE_OPT="--user"
             export KEYLIME_TEST=True
             ;;
-        s)
-            CA_IMP="$OPTARG"
-            case $CA_IMP in
-                (openssl|cfssl) ;; # OK
-                (*) printf >&2 "Invalid: CA Implementation \"$CA_IMP\". Options are openssl or cfssl \n"; exit 1;;
-                esac
-            ;;
         h)
             echo "Usage: $0 [option...]"
             echo "Options:"
             echo $'-c \t\t Run Coverage scans'
             echo $'-u \t\t Run in user (non-root) mode'
-            echo $'-s ssl \t\t Select CA implementation (openssl|cfssl)'
             echo $'-h \t\t This help info'
             exit
             ;;
@@ -97,7 +66,10 @@ case "$ID" in
 
     fedora)
         PACKAGE_MGR="dnf"
+    ;;
 
+    sles | opensuse-leap | opensuse-tumbleweed )
+        PACKAGE_MGR="zypper"
     ;;
 
     *)
@@ -107,7 +79,7 @@ esac
 
 # Permissions-related sanity checking
 if [[ "$USER_MODE" -eq "0" && $EUID -ne 0 ]]; then
-   echo "This script must be run as root in order to call apt-get and install python dependencies.  Use -u for user mode." 1>&2
+   echo "This script must be run as root in order to install dependencies.  Use -u for user mode." 1>&2
    exit 1
 fi
 
@@ -118,43 +90,28 @@ fi
 
 
 # Keylime directory validity check
-if [[ ! -d "$KEYLIME_DIR/test" || ! -d "$KEYLIME_DIR/keylime" ]] ; then
-    echo "ERROR: Invalid keylime directory at $KEYLIME_DIR"
+if [[ ! -d "$KEYLIME_SRC/test" || ! -d "$KEYLIME_SRC/keylime" ]] ; then
+    echo "ERROR: Invalid keylime directory at $KEYLIME_SRC"
     exit 1
-fi
-
-# Copy keyline.conf into place
-if [ ! -f "/etc/keylime.conf" ]; then
-    if [ "$USER_MODE" == "1" ]; then
-        echo -e "keylime.conf cannot be copied as a non-root user, please copy keylime.conf to etc/ and restart script"
-        exit 1
-    else
-        echo -e "Copying keylime.conf into /etc/keylime.conf"
-        cp -n $KEYLIME_DIR/keylime.conf /etc/keylime.conf
-        echo -e "Setting require_ek_cert to False"
-        sed -i 's/require_ek_cert = True/require_ek_cert = False/g' /etc/keylime.conf
-        if [ "$CA_IMP" == "openssl" ]; then
-            echo -e "Setting CA Implementation to OpenSSL"
-            sed -i 's/ca_implementation = cfssl/ca_implementation = openssl/g' /etc/keylime.conf
-        elif [ "$CA_IMP" == "cfssl" ]; then
-            $PACKAGE_MGR install -y golang
-        fi
-    fi
 fi
 
 # Set correct dependencies
 # Fedora
 if [ $PACKAGE_MGR = "dnf" ]; then
-    PYTHON_PREIN="python"
-    PYTHON_DEPS="python-pip python2-dbus"
+    PYTHON_PREIN="python3 openssl"
+    PYTHON_DEPS="python3-pip python3-dbus"
 # RHEL / CentOS etc
 elif [ $PACKAGE_MGR = "yum" ]; then
-    PYTHON_PREIN="epel-release python"
-    PYTHON_DEPS="python-pip dbus-python"
+    PYTHON_PREIN="epel-release python36 openssl"
+    PYTHON_DEPS="python36-pip python36-dbus"
 # Ubuntu / Debian
 elif [ $PACKAGE_MGR = "apt-get" ]; then
-    PYTHON_PREIN="python"
-    PYTHON_DEPS="python-pip python-dbus"
+    PYTHON_PREIN="python3 openssl"
+    PYTHON_DEPS="python3-pip python3-dbus"
+# SUSE
+elif [ $PACKAGE_MGR = "zypper" ]; then
+    PYTHON_PREIN="python3 openssl"
+    PYTHON_DEPS="python3-pip python3-dbus"
 else
     echo "No recognized package manager found on this system!" 1>&2
     exit 1
@@ -162,7 +119,6 @@ fi
 
 if [[ "$USER_MODE" -ne "0" ]] ; then
     echo -e "Packages '$PYTHON_DEPS' are required for this script.  Please manually install them, or run this script as root." 1>&2
-    exit 1
 fi
 
 echo
@@ -172,18 +128,85 @@ echo "==========================================================================
 $PACKAGE_MGR install -y $PYTHON_PREIN
 $PACKAGE_MGR install -y $PYTHON_DEPS
 
+echo
+echo "=================================================================================="
+echo $'\t\t\tCreate and activate virtual environment'
+echo "=================================================================================="
+if [[ ! -d /tmp/keylime_test ]]; then
+    python3 -m venv --system-site-packages /tmp/keylime_test
+fi
+
+source /tmp/keylime_test/bin/activate
+
+pip install --upgrade pip
+
+# Deactivate virtual environment on exit
+trap deactivate EXIT
+
 # Install test dependencies
 echo
 echo "=================================================================================="
 echo $'\t\t\tInstalling test requirements'
 echo "=================================================================================="
-pip install $UMODE_OPT -r $KEYLIME_DIR/test/test-requirements.txt
+pip3 install $UMODE_OPT -r $KEYLIME_SRC/test/test-requirements.txt
 
+KEYLIME_TEMP_DIR=`mktemp -d`
+if [[ ! "$KEYLIME_TEMP_DIR" || ! -d "$KEYLIME_TEMP_DIR" ]]; then
+    echo "Could not create temp dir"
+    exit 1
+fi
+
+export KEYLIME_TEMP_DIR=$KEYLIME_TEMP_DIR
+
+# Install Keylime
+echo
+echo "=================================================================================="
+echo $'\t\t\tInstalling Keylime'
+echo "=================================================================================="
+cd $KEYLIME_SRC
+pip install . -r requirements.txt
+
+echo "=================================================================================="
+echo $'\t\t\tGenerating configuration'
+echo "=================================================================================="
+export KEYLIME_CONF_DIR=$KEYLIME_TEMP_DIR/conf
+mkdir -p $KEYLIME_CONF_DIR
+python3 -m keylime.cmd.convert_config \
+    --defaults \
+    --out  $KEYLIME_CONF_DIR\
+    --templates $KEYLIME_SRC/templates
+
+echo -e "Setting require_ek_cert to False"
+sed -i 's/require_ek_cert = True/require_ek_cert = False/g' $KEYLIME_CONF_DIR/tenant.conf
+
+export KEYLIME_VERIFIER_CONFIG=$KEYLIME_CONF_DIR/verifier.conf
+export KEYLIME_REGISTRAR_CONFIG=$KEYLIME_CONF_DIR/registrar.conf
+export KEYLIME_TENANT_CONFIG=$KEYLIME_CONF_DIR/tenant.conf
+export KEYLIME_CA_CONFIG=$KEYLIME_CONF_DIR/ca.conf
+export KEYLIME_LOGGING_CONFIG=$KEYLIME_CONF_DIR/logging.conf
+
+export KEYLIME_DIR=$KEYLIME_TEMP_DIR/keylime_dir
+
+echo "=================================================================================="
+echo $'\t\t\tRunning Unit Tests'
+echo "=================================================================================="
+# Run separate unit tests
+python3 -m unittest discover -s keylime/ima -p '*_test.py' -v
+if [ $? -ne 0 ]; then
+    echo "Error: Unit tests failed"
+    exit 1
+fi
+
+python3 -m unittest discover -s keylime/tpm -p '*_test.py' -v
+if [ $? -ne 0 ]; then
+    echo "Error: Unit tests failed"
+    exit 1
+fi
 
 # Run the tests as necessary
 if [[ "$COVERAGE" -eq "1" ]] ; then
     # Coverage config file
-    echo -e "[run]\nsource = $KEYLIME_DIR/keylime\nomit = /usr/local/lib/,\"*/test/*\",$KEYLIME_DIR/keylime/test.py" > $COVERAGE_DIR/.coveragerc
+    echo -e "[run]\nsource = $KEYLIME_SRC/keylime\nomit = /usr/local/lib/,\"*/test/*\",$KEYLIME_SRC/keylime/test.py" > $COVERAGE_DIR/.coveragerc
 
     echo
     echo "=================================================================================="
@@ -202,6 +225,7 @@ if [[ "$COVERAGE" -eq "1" ]] ; then
     coverage report
     coverage html
     popd 1>/dev/null
+    result=0
 else
     # Do generic testing with no coverage
     echo
@@ -209,5 +233,18 @@ else
     echo $'\t\t\tBegin Testing Phase'
     echo "=================================================================================="
     green -vv
-    exit $?
+    result=$?
 fi
+
+echo "=================================================================================="
+echo $'\t\t\tCleanup'
+echo "=================================================================================="
+# The generated files can be kept by setting the environment variable KEEP_TMP_FILES=1
+if [[ ! "$KEEP_TMP_FILES" -eq "1" ]]; then
+    echo -e "Removing $KEYLIME_TEMP_DIR"
+    rm -rf $KEYLIME_TEMP_DIR
+else
+    echo -e "Not removing $KEYLIME_TEMP_DIR as KEEP_TMP_FILES == 1"
+fi
+
+exit $result

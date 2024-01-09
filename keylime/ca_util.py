@@ -1,515 +1,472 @@
-#!/usr/bin/env python
+"""Tools for creating a CA cert and signed server certs.
 
-'''
-DISTRIBUTION STATEMENT A. Approved for public release: distribution unlimited.
-
-This material is based upon work supported by the Assistant Secretary of Defense for 
-Research and Engineering under Air Force Contract No. FA8721-05-C-0002 and/or 
-FA8702-15-D-0001. Any opinions, findings, conclusions or recommendations expressed in this
-material are those of the author(s) and do not necessarily reflect the views of the 
-Assistant Secretary of Defense for Research and Engineering.
-
-Copyright 2015 Massachusetts Institute of Technology.
-
-The software/firmware is provided to you on an As-Is basis
-
-Delivered to the US Government with Unlimited Rights, as defined in DFARS Part 
-252.227-7013 or 7014 (Feb 2014). Notwithstanding any copyright notice, U.S. Government 
-rights in this work are defined by DFARS 252.227-7013 or DFARS 252.227-7014 as detailed 
-above. Use of this work other than as specifically authorized by the U.S. Government may 
-violate any copyrights that exist in this work.
-'''
-
-import common
-logger = common.init_logging('ca-util')
-
-import sys
-import os
-import crypto
-import base64
-import argparse
-import ConfigParser
-import getpass
-import json
-import zipfile
-import cStringIO
-import socket
-import revocation_notifier
-import threading
-import BaseHTTPServer
-from BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
-from SocketServer import ThreadingMixIn
-import functools
-import signal
-import time
-import cmd_exec
-import datetime
-
-if common.CA_IMPL=='cfssl':
-    import ca_impl_cfssl as ca_impl
-elif common.CA_IMPL=='openssl':
-    import ca_impl_openssl as ca_impl
-else:
-    raise Exception("Unknown CA implementation: %s"%common.CA_IMPL)
-from M2Crypto import X509, EVP, BIO
-
-config = ConfigParser.SafeConfigParser()
-config.read(common.CONFIG_FILE)
-
-"""
-Tools for creating a CA cert and signed server certs.
 Divined from http://svn.osafoundation.org/m2crypto/trunk/tests/test_x509.py
 The mk_temporary_xxx calls return a NamedTemporaryFile with certs.
-Usage ;
-   # Create a temporary CA cert and it's private key
-   cacert, cakey = mk_temporary_cacert()
-   # Create a temporary server cert+key, signed by the CA
-   server_cert = mk_temporary_cert(cacert.name, cakey.name, '*.server.co.uk')
+Usage:
+  # Create a temporary CA cert and it's private key
+  cacert, cakey = mk_temporary_cacert()
+  # Create a temporary server cert+key, signed by the CA
+  server_cert = mk_temporary_cert(cacert.name, cakey.name, '*.server.co.uk')
+
+Protips:
+  # openssl verify -CAfile cacert.crt cacert.crt cert.crt
+  # openssl x509 -in cert.crt -noout -text
+  # openssl x509 -in cacert.crt -noout -text
+
 """
-# protips
-# openssl verify -CAfile cacert.crt cacert.crt cert.crt
-# openssl x509 -in cert.crt -noout -text
-# openssl x509 -in cacert.crt -noout -text
 
-global_password=None
-def globalcb(*args):
-    global global_password
-    return str(global_password)
+import argparse
+import base64
+import getpass
+import glob
+import io
+import os
+import sys
+import zipfile
+from typing import Any, Dict, List, Optional, Tuple
 
-def setpassword(pw):
+import yaml
+
+try:
+    from yaml import CSafeDumper as SafeDumper
+    from yaml import CSafeLoader as SafeLoader
+except ImportError:
+    from yaml import SafeLoader, SafeDumper  # type: ignore
+
+from cryptography import exceptions as crypto_exceptions
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.asymmetric.dsa import DSAPrivateKey
+from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed448 import Ed448PrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
+from cryptography.x509 import Certificate
+
+from keylime import ca_impl_openssl as ca_impl
+from keylime import config, crypto, fs_util, keylime_logging
+
+logger = keylime_logging.init_logging("ca-util")
+
+global_password: Optional[str] = None
+
+
+def load_cert_by_path(cert_path: str) -> Certificate:
+    cert = None
+    with open(cert_path, "rb") as ca_file:
+        cert = x509.load_pem_x509_certificate(
+            data=ca_file.read(),
+            backend=default_backend(),
+        )
+    return cert
+
+
+def read_password(key_store_pw: Optional[str] = None) -> None:
     global global_password
-    if len(pw)==0:
+    if not key_store_pw:
+        key_store_pw = config.get("ca", "password", fallback="default")
+
+    if key_store_pw == "default":
+        logger.warning("Using 'default' password option from CA configuration file")
+    global_password = key_store_pw
+
+
+def ask_password(key_store_pw: Optional[str] = None) -> None:
+    global global_password
+    if not key_store_pw:
+        key_store_pw = config.get("ca", "password", fallback="default")
+
+    if key_store_pw == "default":
+        logger.warning(
+            "The 'default' password option from CA configuration file cannot be used with keylime CLI (keylime_tenant or keylime_ca)"
+        )
+        key_store_pw = getpass.getpass("Please enter the password to decrypt your keystore: ")
+
+    if not key_store_pw:
         raise Exception("You must specify a password!")
-    global_password = pw
+    global_password = key_store_pw
 
-def cmd_mkcert(workingdir,name):
+
+def cmd_mkcert(workingdir: str, name: str, password: Optional[str] = None) -> None:
+    cwd = os.getcwd()
+    mask = os.umask(0o037)
+    try:
+        fs_util.ch_dir(workingdir)
+        priv = read_private(False)
+        cacert = load_cert_by_path("cacert.crt")
+        ca_pk = serialization.load_pem_private_key(priv[0]["ca"], password=None, backend=default_backend())
+        if not isinstance(
+            ca_pk, (EllipticCurvePrivateKey, RSAPrivateKey, DSAPrivateKey, Ed448PrivateKey, Ed25519PrivateKey)
+        ):
+            raise Exception(
+                f"Private key of type {type(ca_pk).__name__} cannot be used for creating an x509 certificate"
+            )
+
+        cert, pk = ca_impl.mk_signed_cert(cacert, ca_pk, name, priv[0]["lastserial"] + 1)
+
+        with os.fdopen(os.open(f"{name}-cert.crt", os.O_WRONLY | os.O_CREAT, 0o640), "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+        priv[0][name] = pk.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.BestAvailableEncryption(password.encode("utf-8"))
+            if password
+            else serialization.NoEncryption(),
+        )
+
+        # increment serial number after successful creation
+        priv[0]["lastserial"] += 1
+
+        write_private(priv)
+
+        with os.fdopen(os.open(f"{name}-private.pem", os.O_WRONLY | os.O_CREAT, 0o640), "wb") as f:
+            f.write(priv[0][name])
+
+        with os.fdopen(os.open(f"{name}-public.pem", os.O_WRONLY | os.O_CREAT, 0o640), "wb") as f:
+            f.write(
+                pk.public_key().public_bytes(
+                    encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo
+                )
+            )
+
+        cc = load_cert_by_path(f"{name}-cert.crt")
+        pubkey = cacert.public_key()
+        assert isinstance(pubkey, rsa.RSAPublicKey)
+        assert cc.signature_hash_algorithm is not None
+        pubkey.verify(
+            cc.signature,
+            cc.tbs_certificate_bytes,
+            padding.PKCS1v15(),
+            cc.signature_hash_algorithm,
+        )
+
+        logger.info("Created certificate for name %s successfully in %s", name, workingdir)
+    except crypto_exceptions.InvalidSignature:
+        logger.error("ERROR: Cert does not validate against CA")
+    finally:
+        os.umask(mask)
+        os.chdir(cwd)
+
+
+def cmd_import_priv(workingdir: str, priv_pem_file: str, lastserial: int) -> None:
     cwd = os.getcwd()
     try:
-        common.ch_dir(workingdir,logger)
-        priv = read_private()
-        
-        cacert = X509.load_cert('cacert.crt')
-        ca_pk = EVP.load_key_string(str(priv[0]['ca']))
-            
-        cert,pk = ca_impl.mk_signed_cert(cacert,ca_pk,name,priv[0]['lastserial']+1)
-        with open('%s-cert.crt'%name, 'w') as f:
-            f.write(cert.as_pem())
-            
-        f = BIO.MemoryBuffer() 
-        pk.save_key_bio(f,None)
-        priv[0][name]=f.getvalue()
-        f.close()
-        
-        #increment serial number after successful creation
-        priv[0]['lastserial']+=1
-        
+        with open(priv_pem_file, "rb") as priv_pem:
+            pem = priv_pem.read()
+        fs_util.ch_dir(workingdir)
+        priv = read_private(False)
+        private_key = load_pem_private_key(pem, None, default_backend())
+        priv[0]["ca"] = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        priv[0]["lastserial"] = int(lastserial) + 1
         write_private(priv)
-        
-        # write out the private key with password
-        with os.fdopen(os.open("%s-private.pem"%name,os.O_WRONLY | os.O_CREAT,0600), 'w') as f:
-            biofile = BIO.File(f)
-            pk.save_key_bio(biofile, 'aes_256_cbc', globalcb)
-            biofile.close()
-    
-        pk.get_rsa().save_pub_key('%s-public.pem'%name)
-        
-        cc = X509.load_cert('%s-cert.crt'%name)
-        
-        if cc.verify(cacert.get_pubkey()):
-            logger.info("Created certificate for name %s successfully in %s"%(name,workingdir))
-        else:
-            logger.error("ERROR: Cert does not validate against CA")
     finally:
         os.chdir(cwd)
 
-def cmd_init(workingdir):
+
+def cmd_init(workingdir: str) -> None:
     cwd = os.getcwd()
+    mask = os.umask(0o037)
     try:
-        common.ch_dir(workingdir,logger)
-        
+        fs_util.ch_dir(workingdir)
+
         rmfiles("*.pem")
         rmfiles("*.crt")
         rmfiles("*.zip")
         rmfiles("*.der")
-        rmfiles("private.json")
-    
-        cacert, ca_pk, _ = ca_impl.mk_cacert()
-        
-        priv=read_private()
-            
+        rmfiles("private.yml")
+
+        cacert, ca_pk, _ = ca_impl.mk_cacert()  # pylint: disable=W0632
+        priv = read_private(False)
+
         # write out keys
-        with open('cacert.crt', 'wb') as f:
-            f.write(cacert.as_pem())
-    
-        f = BIO.MemoryBuffer() 
-        ca_pk.save_key_bio(f,None)
-        priv[0]['ca']=f.getvalue()
-        f.close()
-        
+        with open("cacert.crt", "wb") as f:
+            f.write(cacert.public_bytes(serialization.Encoding.PEM))
+
+        priv[0]["ca"] = ca_pk.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+
         # store the last serial number created.
         # the CA is always serial # 1
-        priv[0]['lastserial'] = 1
-        
+        priv[0]["lastserial"] = 1
+
         write_private(priv)
-        
-        ca_pk.get_rsa().save_pub_key('ca-public.pem')
-        
+
+        with os.fdopen(os.open("ca-public.pem", os.O_WRONLY | os.O_CREAT, 0o640), "wb") as f:
+            f.write(
+                ca_pk.public_key().public_bytes(
+                    encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo
+                )
+            )
+
         # generate an empty crl
-        crl = ca_impl.gencrl([],cacert.as_pem(),str(priv[0]['ca']))
-        with open('cacrl.der','wb') as f:
+        cacert_str = cacert.public_bytes(serialization.Encoding.PEM).decode()
+        crl = ca_impl.gencrl([], cacert_str, priv[0]["ca"].decode())
+
+        if isinstance(crl, str):
+            crl = crl.encode("utf-8")
+
+        with open("cacrl.der", "wb") as f:
             f.write(crl)
-        convert_crl_to_pem("cacrl.der","cacrl.pem")
-        
+        convert_crl_to_pem("cacrl.der", "cacrl.pem")
+
         # Sanity checks...
-        cac = X509.load_cert('cacert.crt')
-        if cac.verify():
-            logger.info("CA certificate created successfully in %s"%workingdir)
-        else:
-            logger.error("ERROR: Cert does not self validate")
+        cac = load_cert_by_path("cacert.crt")
+        pubkey = cacert.public_key()
+        assert isinstance(pubkey, rsa.RSAPublicKey)
+        assert cac.signature_hash_algorithm is not None
+        pubkey.verify(
+            cac.signature,
+            cac.tbs_certificate_bytes,
+            padding.PKCS1v15(),
+            cac.signature_hash_algorithm,
+        )
+
+        logger.info("CA certificate created successfully in %s", workingdir)
+    except crypto_exceptions.InvalidSignature:
+        logger.error("ERROR: Cert does not self validate")
     finally:
         os.chdir(cwd)
-        
-def cmd_certpkg(workingdir,name,insecure=False):
+        os.umask(mask)
+
+
+def cmd_certpkg(workingdir: str, name: str, insecure: bool = False) -> Tuple[bytes, int, str]:
     cwd = os.getcwd()
     try:
-        common.ch_dir(workingdir,logger)
+        fs_util.ch_dir(workingdir)
         # zip up the crt, private key, and public key
-        
-        with open('cacert.crt','r') as f:
+
+        with open("cacert.crt", "rb") as f:
             cacert = f.read()
-        
-        with open("%s-public.pem"%name,'rb') as f:
+
+        with open(f"{name}-public.pem", "rb") as f:
             pub = f.read()
-            
-        with open("%s-cert.crt"%name,'rb') as f:
+
+        with open(f"{name}-cert.crt", "rb") as f:
             cert = f.read()
-            
-        with open('cacrl.der','r') as f:
+
+        with open("cacrl.der", "rb") as f:
             crl = f.read()
-        
-        with open('cacrl.pem','r') as f:
+
+        with open("cacrl.pem", "rb") as f:
             crlpem = f.read()
-        
-        cert_obj = X509.load_cert_string(cert)
-        serial = cert_obj.get_serial_number()
-        subject = str(cert_obj.get_subject())
-        
-        priv = read_private()
+
+        cert_obj = x509.load_pem_x509_certificate(
+            data=cert,
+            backend=default_backend(),
+        )
+
+        serial = cert_obj.serial_number
+        subject = cert_obj.subject.rfc4514_string()
+
+        priv = read_private(False)
         private = priv[0][name]
-        
-        with open("%s-private.pem"%name,'rb') as f:
+
+        with open(f"{name}-private.pem", "rb") as f:
             prot_priv = f.read()
-        
-        #code to create a pem formatted protected private key using the keystore password
-    #     pk = EVP.load_key_string(str(priv[0][name]))
-    #     f = BIO.MemoryBuffer()
-    #     # globalcb will return the global password provided by the user
-    #     pk.save_key_bio(f, 'aes_256_cbc', globalcb)
-    #     prot_priv = f.getvalue()
-    #     f.close()
-        
+
         # no compression to avoid extraction errors in tmpfs
-        sf = cStringIO.StringIO()
-        with zipfile.ZipFile(sf,'w',compression=zipfile.ZIP_STORED) as f:
-            f.writestr('%s-public.pem'%name,pub)
-            f.writestr('%s-cert.crt'%name,cert)
-            f.writestr('%s-private.pem'%name,private)
-            f.writestr('cacert.crt',cacert)
-            f.writestr('cacrl.der',crl)
-            f.writestr('cacrl.pem',crlpem)
+        sf = io.BytesIO()
+        with zipfile.ZipFile(sf, "w", compression=zipfile.ZIP_STORED) as f:
+            f.writestr(f"{name}-public.pem", pub)
+            f.writestr(f"{name}-cert.crt", cert)
+            f.writestr(f"{name}-private.pem", private)
+            f.writestr("cacert.crt", cacert)
+            f.writestr("cacrl.der", crl)
+            f.writestr("cacrl.pem", crlpem)
         pkg = sf.getvalue()
-        
+
         if insecure:
-            logger.warn("Unprotected private keys in cert package being written to disk")
-            with open('%s-pkg.zip'%name,'w') as f:
+            logger.warning("Unprotected private keys in cert package being written to disk")
+            with open(f"{name}-pkg.zip", "wb") as f:
                 f.write(pkg)
         else:
             # actually output the package to disk with a protected private key
-            with zipfile.ZipFile('%s-pkg.zip'%name,'w',compression=zipfile.ZIP_STORED) as f:
-                f.writestr('%s-public.pem'%name,pub)
-                f.writestr('%s-cert.crt'%name,cert)
-                f.writestr('%s-private.pem'%name,prot_priv)
-                f.writestr('cacert.crt',cacert)
-                f.writestr('cacrl.der',crl)
-                f.writestr('cacrl.pem',crlpem)
+            with zipfile.ZipFile(f"{name}-pkg.zip", "w", compression=zipfile.ZIP_STORED) as f:
+                f.writestr(f"{name}-public.pem", pub)
+                f.writestr(f"{name}-cert.crt", cert)
+                f.writestr(f"{name}-private.pem", prot_priv)
+                f.writestr("cacert.crt", cacert)
+                f.writestr("cacrl.der", crl)
+                f.writestr("cacrl.pem", crlpem)
 
-        logger.info("Creating cert package for %s in %s-pkg.zip"%(name,name))
-        
-        return pkg,serial,subject
+        logger.info("Creating cert package for %s in %s-pkg.zip", name, name)
+
+        return pkg, serial, subject
     finally:
         os.chdir(cwd)
-        
-def convert_crl_to_pem(derfile,pemfile):
-    if config.get('general','ca_implementation')=='openssl':
-        with open(pemfile,'w') as f:
-            f.write("")
-    else:
-        cmd_exec.run("openssl crl -in %s -inform der -out %s"%(derfile,pemfile),lock=False)
-    
-def get_crl_distpoint(cert_path):
-    cert_obj = X509.load_cert(cert_path)
-    text= cert_obj.as_text()
-    incrl=False
-    distpoint=""
-    for line in text.split('\n'):
-        line = line.strip()
-        if line.startswith("X509v3 CRL Distribution Points:"):
-            incrl = True
-        if incrl and line.startswith("URI:"):
-            distpoint = line[4:]
-            break
-    
-    return distpoint
 
-# to check: openssl crl -inform DER -text -noout -in cacrl.der     
-def cmd_revoke(workingdir,name=None,serial=None):
+
+def convert_crl_to_pem(derfile: str, pemfile: str) -> None:
+    with open(derfile, "rb") as der_f, open(pemfile, "wb") as pem_f:
+        der_crl = der_f.read()
+        pem_f.write(x509.load_der_x509_crl(der_crl).public_bytes(encoding=serialization.Encoding.PEM))
+
+
+def cmd_revoke(workingdir: str, name: Optional[str] = None, serial: Optional[int] = None) -> bytes:
     cwd = os.getcwd()
     try:
-        common.ch_dir(workingdir,logger)
-        priv = read_private()
-        
+        fs_util.ch_dir(workingdir)
+        priv = read_private(False)
+
         if name is not None and serial is not None:
             raise Exception("You may not specify a cert and a serial at the same time")
         if name is None and serial is None:
             raise Exception("You must specify a cert or a serial to revoke")
         if name is not None:
             # load up the cert
-            cert = X509.load_cert("%s-cert.crt"%name)
-            serial = cert.get_serial_number()
-            
-        #convert serial to string
-        serial = str(serial)
-            
+            cert = load_cert_by_path(f"{name}-cert.crt")
+            serial = cert.serial_number
+
+        # convert serial to string
+        serial_str = str(serial)
+
         # get the ca key cert and keys as strings
-        with open('cacert.crt','r') as f:
+        with open("cacert.crt", encoding="utf-8") as f:
             cacert = f.read()
-        ca_pk = str(priv[0]['ca'])
-        
-        if serial not in priv[0]['revoked_keys']:
-            priv[0]['revoked_keys'].append(serial)
-        
-        crl = ca_impl.gencrl(priv[0]['revoked_keys'],cacert,ca_pk)
-         
+        ca_pk = priv[0]["ca"].decode("utf-8")
+
+        if serial_str not in priv[0]["revoked_keys"]:
+            priv[0]["revoked_keys"].append(serial_str)
+
+        crl = ca_impl.gencrl(priv[0]["revoked_keys"], cacert, ca_pk)
+
         write_private(priv)
-        
+
         # write out the CRL to the disk
-        with open('cacrl.der','wb') as f:
-            f.write(crl)
-        convert_crl_to_pem("cacrl.der","cacrl.pem")
-        
+        if os.stat("cacrl.der").st_size:
+            with open("cacrl.der", "wb") as f:
+                f.write(crl)
+            convert_crl_to_pem("cacrl.der", "cacrl.pem")
+
     finally:
         os.chdir(cwd)
     return crl
 
-# regenerate the crl without revoking anything
-def cmd_regencrl(workingdir):
-    cwd = os.getcwd()
-    try:
-        common.ch_dir(workingdir,logger)
-        priv = read_private()
-            
-        # get the ca key cert and keys as strings
-        with open('cacert.crt','r') as f:
-            cacert = f.read()
-        ca_pk = str(priv[0]['ca'])
-        
-        crl = ca_impl.gencrl(priv[0]['revoked_keys'],cacert,ca_pk)
-         
-        write_private(priv)
-        
-        # write out the CRL to the disk
-        with open('cacrl.der','wb') as f:
-            f.write(crl)
-        convert_crl_to_pem("cacrl.der","cacrl.pem")
-        
-    finally:
-        os.chdir(cwd)
-    return crl
 
-def cmd_listen(workingdir,cert_path):
-    #just load up the password for later
-    read_private()
-    
-    serveraddr = ('', common.CRL_PORT)
-    server = ThreadedCRLServer(serveraddr,CRLHandler)
-    if os.path.exists('%s/cacrl.der'%workingdir):
-        logger.info("Loading existing crl: %s/cacrl.der"%workingdir)
-        with open('%s/cacrl.der'%workingdir,'r') as f:
-            server.setcrl(f.read())
-    t = threading.Thread(target=server.serve_forever)
-    logger.info("Hosting CRL on %s:%d"%(socket.getfqdn(),common.CRL_PORT))
-    t.start()
-    
-    def check_expiration():
-        logger.info("checking CRL for expiration every hour")
-        while True:
-            try:
-                if os.path.exists('%s/cacrl.der'%workingdir):
-                    retout = cmd_exec.run("openssl crl -inform der -in %s/cacrl.der -text -noout"%workingdir,lock=False)['retout']
-                    for line in retout:
-                        line = line.strip()
-                        if line.startswith("Next Update:"):
-                            expire = datetime.datetime.strptime(line[13:],"%b %d %H:%M:%S %Y %Z")
-                            # check expiration within 6 hours
-                            in1hour = datetime.datetime.utcnow()+datetime.timedelta(hours=6)
-                            if expire<=in1hour:
-                                logger.info("Certificate to expire soon %s, re-issuing"%expire)
-                                cmd_regencrl(workingdir)
-                # check a little less than every hour
-                time.sleep(3540)
-                
-            except KeyboardInterrupt:
-                logger.info("TERM Signal received, shutting down...")
-                #server.shutdown()
-                break
-    
-    t2 = threading.Thread(target=check_expiration)
-    t2.setDaemon(True)
-    t2.start()
-
-    def revoke_callback(revocation):
-        serial = revocation.get("metadata",{}).get("cert_serial",None)
-        if revocation.get('type',None) != 'revocation' or serial is None:
-            logger.error("Unsupported revocation message: %s"%revocation)
-            return
-        
-        logger.info("Revoking certificate: %s"%serial)
-        server.setcrl(cmd_revoke(workingdir, None, serial))
-        
-    try:
-        while True:
-            try:
-                revocation_notifier.await_notifications(revoke_callback,revocation_cert_path=cert_path)
-            except Exception as e:
-                logger.exception(e)
-                logger.warn("No connection to revocation server, retrying in 10s...")
-                time.sleep(10)
-    except KeyboardInterrupt:
-        logger.info("TERM Signal received, shutting down...")
-        server.shutdown()
-        sys.exit()
-    
-class ThreadedCRLServer(ThreadingMixIn, HTTPServer):
-    published_crl = None
-    
-    def setcrl(self,crl):
-        self.published_crl = crl
-        
-
-class CRLHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        logger.info('GET invoked from ' + str(self.client_address)  + ' with uri:' + self.path)
-        
-        if self.server.published_crl is None:
-            self.send_response(404)
-            self.end_headers()
-        else:
-            # send back the CRL
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(self.server.published_crl)
-
-def rmfiles(path):
-    import glob
+def rmfiles(path: str) -> None:
     files = glob.glob(path)
     for f in files:
         os.remove(f)
-        
-def write_private(inp):
+
+
+def write_private(inp: Tuple[Dict[str, Any], str]) -> None:
     priv = inp[0]
     salt = inp[1]
-    global global_password
-    
-    priv_encoded = json.dumps(priv)
-    key = crypto.kdf(global_password,salt)
-    ciphertext = crypto.encrypt(priv_encoded,key)
-    towrite = {'salt':salt,'priv':ciphertext}
-    
-    with os.fdopen(os.open('private.json',os.O_WRONLY | os.O_CREAT,0600), 'w') as f:
-        json.dump(towrite,f)
 
-def read_private():
-    global global_password
-    if global_password is None:
-        setpassword(getpass.getpass("Please enter the password to decrypt your keystore: "))
+    priv_encoded = yaml.dump(priv, Dumper=SafeDumper)
+    assert isinstance(global_password, str)
+    key = crypto.kdf(global_password, salt)
+    ciphertext = crypto.encrypt(priv_encoded.encode("utf-8"), key)
+    towrite = {"salt": salt, "priv": ciphertext}
 
-    if os.path.exists('private.json'):
-        with open('private.json','r') as f:
-            toread = json.load(f)
-        key = crypto.kdf(global_password,toread['salt'])
+    mask = os.umask(0o037)
+    with os.fdopen(os.open("private.yml", os.O_WRONLY | os.O_CREAT, 0o640), "w", encoding="utf-8") as f:
+        yaml.dump(towrite, f, Dumper=SafeDumper)
+    os.umask(mask)
+
+
+def read_private(warn: bool = False) -> Tuple[Dict[str, Any], str]:
+    if os.path.exists("private.yml"):
+        with open("private.yml", encoding="utf-8") as f:
+            toread = yaml.load(f, Loader=SafeLoader)
+        assert isinstance(global_password, str)
+        key = crypto.kdf(global_password, toread["salt"])
         try:
-            plain = crypto.decrypt(toread['priv'],key)
-        except ValueError:
-            raise Exception("Invalid password for keystore")
-            
-        return json.loads(plain),toread['salt']
-    else:
-        #file doesn't exist, just invent a salt
-        return {'revoked_keys':[]},base64.b64encode(crypto.generate_random_key())
+            plain = crypto.decrypt(toread["priv"], key)
+        except crypto_exceptions.InvalidTag as e:
+            raise Exception("Invalid password for keystore") from e
 
-def main(argv=sys.argv):
+        return yaml.load(plain, Loader=SafeLoader), toread["salt"]
+
+    if warn:
+        # file doesn't exist, just invent a salt
+        logger.warning("Private certificate data %s does not exist yet.", os.path.abspath("private.yml"))
+        logger.warning("Keylime will attempt to load private certificate data again when it is needed.")
+    return {"revoked_keys": [], "ca": b""}, base64.b64encode(crypto.generate_random_key()).decode()
+
+
+def main(argv: List[str] = sys.argv) -> None:  # pylint: disable=dangerous-default-value
     parser = argparse.ArgumentParser(argv[0])
-    parser.add_argument('-c', '--command',action='store',dest='command',required=True,help="valid commands are init,create,pkg,revoke,listen")
-    parser.add_argument('-n', '--name',action='store',help='the common name of the certificate to create')
-    parser.add_argument('-d','--dir',action='store',help='use a custom directory to store certificates and keys')
-    parser.add_argument('-i','--insecure',action='store_true',default=False,help='create cert packages with unprotected private keys and write them to disk.  USE WITH CAUTION!')
+    parser.add_argument(
+        "-c",
+        "--command",
+        action="store",
+        dest="command",
+        required=True,
+        help="valid commands are init,create,pkg,revoke,listen,import-priv",
+    )
+    parser.add_argument("-n", "--name", action="store", help="the common name of the certificate to create")
+    parser.add_argument("-d", "--dir", action="store", help="use a custom directory to store certificates and keys")
+    parser.add_argument(
+        "-i",
+        "--insecure",
+        action="store_true",
+        default=False,
+        help="create cert packages with unprotected private keys and write them to disk.  USE WITH CAUTION!",
+    )
+    parser.add_argument(
+        "-f", "--file", action="store", default="ca-private.pem", help="file path of the private key of the CA cert"
+    )
+    parser.add_argument("-s", "--serial", action="store", help="last serial number the CA has used")
+    args = parser.parse_args(argv[1:])
 
-    if common.DEVELOP_IN_ECLIPSE and len(argv)==1:
-        argv=['-c','init']
-        #argv=['-c','create','-n',socket.getfqdn()]
-        argv=['-c','create','-n','client']
-        #argv=['-c','pkg','-n','client']
-        argv=['-c','revoke','-n','client']
-        argv=['-c','listen','-d','myca']
-    else:
-        argv = argv[1:]
-        
-    # never prompt for passwords in development mode
-    if common.DEVELOP_IN_ECLIPSE:
-        setpassword('default')
-        
-    args = parser.parse_args(argv)
-    
-    if args.dir==None:
-        if os.getuid()!=0 and common.REQUIRE_ROOT:
-            logger.error("If you don't specify a working directory, this process must be run as root to access %s"%common.WORK_DIR)
+    if args.dir is None:
+        if not os.access(config.WORK_DIR, os.R_OK + os.W_OK):
+            logger.error(
+                "If you don't specify a working directory, this process must be run as a user with access to %s",
+                config.WORK_DIR,
+            )
             sys.exit(-1)
-        workingdir = common.CA_WORK_DIR
+        workingdir = config.CA_WORK_DIR
     else:
         workingdir = args.dir
 
-    if args.command=='init':
+    # set a conservative general umask
+    os.umask(0o077)
+
+    if args.command == "init":
+        ask_password(None)
         cmd_init(workingdir)
-    elif args.command=='create':
+    elif args.command == "create":
         if args.name is None:
             logger.error("you must pass in a name for the certificate using -n (or --name)")
             parser.print_help()
             sys.exit(-1)
-        cmd_mkcert(workingdir,args.name)
-    elif args.command=='pkg':
+        ask_password(None)
+        cmd_mkcert(workingdir, args.name)
+    elif args.command == "pkg":
         if args.name is None:
             logger.error("you must pass in a name for the certificate using -n (or --name)")
             parser.print_help()
             sys.exit(-1)
-        cmd_certpkg(workingdir,args.name,args.insecure)
-    elif args.command=='revoke':
+        ask_password(None)
+        cmd_certpkg(workingdir, args.name, args.insecure)
+    elif args.command == "revoke":
         if args.name is None:
             logger.error("you must pass in a name for the certificate using -n (or --name)")
             parser.print_help()
             sys.exit(-1)
+        ask_password(None)
         cmd_revoke(workingdir, args.name)
-    elif args.command=='listen':
-        if args.name is None:
-            args.name = "%s/RevocationNotifier-cert.crt"%workingdir
-            logger.warning("using default name for revocation cert %s"%args.name)
-        cmd_listen(workingdir,args.name)
+    elif args.command == "import-priv":
+        if args.serial is None:
+            logger.error("you must pass in the last serial number the CA has used using -s (or --serial)")
+            parser.print_help()
+            sys.exit(-1)
+        ask_password(None)
+        cmd_import_priv(workingdir, args.file, args.serial)
     else:
-        logger.error("Invalid command: %s"%args.command)
+        logger.error("Invalid command: %s", args.command)
         parser.print_help()
         sys.exit(-1)
-    
-if __name__=="__main__":
-    try:
-        main()
-    except Exception as e:
-        logger.exception(e)

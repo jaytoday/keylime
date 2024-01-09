@@ -1,75 +1,97 @@
-'''DISTRIBUTION STATEMENT A. Approved for public release: distribution unlimited.
-
-This material is based upon work supported by the Assistant Secretary of Defense for 
-Research and Engineering under Air Force Contract No. FA8721-05-C-0002 and/or 
-FA8702-15-D-0001. Any opinions, findings, conclusions or recommendations expressed in this
-material are those of the author(s) and do not necessarily reflect the views of the 
-Assistant Secretary of Defense for Research and Engineering.
-
-Copyright 2015 Massachusetts Institute of Technology.
-
-The software/firmware is provided to you on an As-Is basis
-
-Delivered to the US Government with Unlimited Rights, as defined in DFARS Part 
-252.227-7013 or 7014 (Feb 2014). Notwithstanding any copyright notice, U.S. Government 
-rights in this work are defined by DFARS 252.227-7013 or DFARS 252.227-7014 as detailed 
-above. Use of this work other than as specifically authorized by the U.S. Government may 
-violate any copyrights that exist in this work.
-'''
-
 import os
 import subprocess
-import threading
-import common
+import sys
 import time
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
+
+from keylime import keylime_logging
+
+if sys.version_info >= (3, 8):
+    from typing import TypedDict
+else:
+    from typing_extensions import TypedDict
 
 
-# shared lock to serialize access to tools
-utilLock = threading.Lock()
+# setup logging
+logger = keylime_logging.init_logging("keylime.cmd_exec")
 
-EXIT_SUCESS=0
+EXIT_SUCESS = 0
+
+EnvType = Dict[str, str]
 
 
-def run(cmd,expectedcode=EXIT_SUCESS,raiseOnError=True,lock=True,outputpaths=None,env=os.environ):
-    global utilLock
+class RetDictType(TypedDict):
+    retout: List[bytes]
+    reterr: List[bytes]
+    code: int
+    fileouts: Dict[str, bytes]
+    timing: Dict[str, float]
 
+
+def _execute(cmd: Sequence[str], env: Optional[EnvType] = None, **kwargs: Any) -> Tuple[bytes, bytes, int]:
+    with subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs) as proc:
+        out, err = proc.communicate()
+        # All callers assume to receive a list of bytes back; none of them uses 'text mode'
+        assert isinstance(out, bytes)
+        assert isinstance(err, bytes)
+        return out, err, proc.returncode
+
+
+def run(
+    cmd: Sequence[str],
+    expectedcode: int = EXIT_SUCESS,
+    raiseOnError: bool = True,
+    outputpaths: Optional[Union[List[str], str]] = None,
+    env: Optional[EnvType] = None,
+    **kwargs: Any,
+) -> RetDictType:
+    """Execute external command.
+
+    :param cmd: a sequence of command arguments
+    """
+    if env is None:
+        env = cast(EnvType, os.environ)  # cannot use os._Environ as type
+
+    logger.debug('Executing command "%s"', " ".join(cmd))
     t0 = time.time()
-    if lock:
-        with utilLock:
-            proc = subprocess.Popen(cmd,env=env,shell=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
-            code = proc.wait()
-    else:
-        proc = subprocess.Popen(cmd,env=env,shell=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
-        code = proc.wait()
+    retout, reterr, code = _execute(cmd, env=env, **kwargs)
+
     t1 = time.time()
-    timing = {'t1': t1, 't0': t0}
+    timing = {"t1": t1, "t0": t0}
 
+    # Gather subprocess response data; retout & reterr are assumed to be 'bytes'
+    retout_list = retout.splitlines(keepends=True)
+    reterr_list = reterr.splitlines(keepends=True)
 
-    # Gather subprocess response data 
-    retout = []
-    while True:
-        line = proc.stdout.readline()
-        if line=="":
-            break
-        retout.append(line)
-
-    # Don't bother continuing if call failed and we're raising on error 
-    if code!=expectedcode and raiseOnError:
-        raise Exception("Command: %s returned %d, expected %d, output %s"%(cmd,code,expectedcode,retout))
+    # Don't bother continuing if call failed and we're raising on error
+    if code != expectedcode and raiseOnError:
+        raise Exception(
+            f"Command: {cmd} returned {code}, expected {expectedcode}, " f"output {reterr_list}, stderr {reterr_list}"
+        )
 
     # Prepare to return their file contents (if requested)
-    fileouts={}
-    if isinstance(outputpaths, basestring):
+    fileouts = {}
+    if isinstance(outputpaths, str):
         outputpaths = [outputpaths]
     if isinstance(outputpaths, list):
         for thispath in outputpaths:
             with open(thispath, "rb") as f:
                 fileouts[thispath] = f.read()
 
-    returnDict = {
-        'retout': retout,
-        'code': code,
-        'fileouts': fileouts,
-        'timing': timing,
+    returnDict: RetDictType = {
+        "retout": retout_list,
+        "reterr": reterr_list,
+        "code": code,
+        "fileouts": fileouts,
+        "timing": timing,
     }
     return returnDict
+
+
+# list_contains_substring checks whether a substring is contained in the given
+# list. The list may be the reterr from 'run' and contains bytes-like objects.
+def list_contains_substring(lst: List[bytes], substring: str) -> bool:
+    for s in lst:
+        if substring in str(s):
+            return True
+    return False
